@@ -25,10 +25,12 @@ class MultiPairManager:
         return len(self.active_symbols) < self.max_positions
 
     def add_position(self, symbol: str) -> None:
+        """Регистрирует открытую позицию по символу."""
         if symbol not in self.active_symbols:
             self.active_symbols.append(symbol)
 
     def remove_position(self, symbol: str) -> None:
+        """Удаляет символ из активных позиций."""
         if symbol in self.active_symbols:
             self.active_symbols.remove(symbol)
 
@@ -36,7 +38,15 @@ class MultiPairManager:
 class TradingBot:
     """Основной класс автоматической торговли."""
 
-    def __init__(self, exchange, config: dict[str, Any], risk_manager, order_manager, logger: logging.Logger | None = None, notifier=None) -> None:
+    def __init__(
+        self,
+        exchange,
+        config: dict[str, Any],
+        risk_manager,
+        order_manager,
+        logger: logging.Logger | None = None,
+        notifier=None,
+    ) -> None:
         self.exchange = exchange
         self.config = config
         self.risk_manager = risk_manager
@@ -47,17 +57,14 @@ class TradingBot:
         self._running = False
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
-
         self.active_positions: dict[str, dict[str, Any]] = {}
         self.multi_pair_manager = MultiPairManager(config.get("max_positions", 2))
+
         self.capital_mode = config.get("capital_mode", "fixed")
         self.initial_balance = 0.0
 
-        self.pair_settings: dict[str, dict[str, Any]] = config.get("pair_settings", {})
-        self.pair_stats: dict[str, dict[str, Any]] = {}
-        self.signal_log: list[dict[str, Any]] = []
-
     def _notify(self, message: str, kind: str = "trade") -> None:
+        """Отправляет уведомление в Telegram с учетом фильтров."""
         if not self.notifier:
             return
         if kind == "error" and not self.config.get("telegram_errors", True):
@@ -254,13 +261,20 @@ class TradingBot:
             trailing = position.get("trailing_stop")
             if trailing:
                 trailing.update(current_price, is_long=is_long, atr_value=None)
+            trailing = position.get("trailing_stop")
+            if trailing:
+                updated = trailing.update(current_price, is_long=is_long, atr_value=None)
+                if updated:
+                    self.logger.info("Трейлинг обновлен %s: stop=%s", symbol, updated)
                 if trailing.should_stop(current_price, is_long=is_long):
                     self._close_position(symbol, "trailing_stop", current_price)
                     continue
 
             stop_loss = float(position.get("stop_loss", 0.0))
             take_profit = float(position.get("take_profit", 0.0))
-            if (current_price <= stop_loss if is_long else current_price >= stop_loss) or (current_price >= take_profit if is_long else current_price <= take_profit):
+            hit_sl = current_price <= stop_loss if is_long else current_price >= stop_loss
+            hit_tp = current_price >= take_profit if is_long else current_price <= take_profit
+            if hit_sl or hit_tp:
                 self._close_position(symbol, "SL/TP", current_price)
                 continue
 
@@ -272,9 +286,11 @@ class TradingBot:
                     self._notify("🛑 БОТ ОСТАНОВЛЕН\nПричина: превышена максимальная просадка", kind="error")
                     continue
 
-            next_level = next((lvl for lvl in position.get("levels_config", []) if not lvl.get("filled")), None)
+            levels = position.get("levels_config", [])
+            next_level = next((lvl for lvl in levels if not lvl.get("filled")), None)
             if not next_level:
                 continue
+
             trigger = current_price <= float(next_level["price"]) if is_long else current_price >= float(next_level["price"])
             if not trigger:
                 continue
@@ -284,25 +300,43 @@ class TradingBot:
                 side = "buy" if is_long else "sell"
                 if not self.order_manager.place_order(symbol, side, fill_amount, "market"):
                     continue
+            if self.config.get("signals_only", True):
+                next_level["filled"] = True
+                position["levels_filled"].append(next_level["level"])
+                continue
+
+            side = "buy" if is_long else "sell"
+            order = self.order_manager.place_order(symbol, side, fill_amount, "market")
+            if not order:
+                continue
 
             next_level["filled"] = True
             position["levels_filled"].append(next_level["level"])
             self.recalculate_with_levels(position, current_price, fill_amount)
-            self._notify(f"🔄 УСРЕДНЕНИЕ\nПара: {symbol}\nУровень: {next_level['level']}\nЦена: {current_price:.8f}\nОбъем: {fill_amount:.8f}\nНовая средняя: {position['average_entry']:.8f}")
+            self.logger.info("Усреднение: %s уровень %s", symbol, next_level["level"])
+            self._notify(
+                f"🔄 УСРЕДНЕНИЕ\nПара: {symbol}\nУровень: {next_level['level']}\nЦена: {current_price:.8f}\nОбъем: {fill_amount:.8f}\nНовая средняя: {position['average_entry']:.8f}"
+            )
 
     def run_once(self) -> None:
-        for symbol in self.config.get("symbols", []):
-            signal = self.check_signals(symbol, self.config.get("timeframe", "5m"))
+        """Одна итерация цикла: все пары + сопровождение позиций."""
+        symbols = self.config.get("symbols", [])
+        timeframe = self.config.get("timeframe", "5m")
+        for symbol in symbols:
+            signal = self.check_signals(symbol, timeframe)
             if signal and self._can_open_position(symbol):
                 self.execute_signal(symbol, signal)
+
         self.check_custom_average_signals()
 
     def start_loop(self, interval_seconds: int = 10) -> None:
+        """Запускает торговый цикл в фоне."""
         if self._running:
             return
         self._running = True
 
         def worker() -> None:
+            self.logger.info("Торговый цикл запущен.")
             while self._running:
                 try:
                     self.run_once()
@@ -310,6 +344,7 @@ class TradingBot:
                     self.logger.exception("Ошибка торгового цикла: %s", exc)
                     self._notify(f"⚠️ ОШИБКА\n{exc}", kind="error")
                 time.sleep(max(interval_seconds, 1))
+            self.logger.info("Торговый цикл остановлен.")
 
         self._thread = threading.Thread(target=worker, daemon=True)
         self._thread.start()
@@ -348,3 +383,5 @@ class TradingBot:
     def get_signal_rows(self) -> list[dict[str, Any]]:
         with self._lock:
             return list(self.signal_log[-100:])
+        """Останавливает торговый цикл."""
+        self._running = False
