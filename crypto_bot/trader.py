@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from copy import deepcopy
 from typing import Any
 
 from indicators import add_bollinger, add_macd, add_rsi, add_volume_ratio
@@ -15,11 +16,10 @@ class MultiPairManager:
     """Управление количеством одновременных позиций по разным парам."""
 
     def __init__(self, max_positions: int = 2) -> None:
-        self.max_positions = max(int(max_positions), 1)
+        self.max_positions = max(1, min(int(max_positions), 50))
         self.active_symbols: list[str] = []
 
     def can_open_new_position(self, symbol: str) -> bool:
-        """Проверяет, можно ли открыть новую позицию."""
         if symbol in self.active_symbols:
             return False
         return len(self.active_symbols) < self.max_positions
@@ -56,6 +56,7 @@ class TradingBot:
 
         self._running = False
         self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
         self.active_positions: dict[str, dict[str, Any]] = {}
         self.multi_pair_manager = MultiPairManager(config.get("max_positions", 2))
 
@@ -72,13 +73,23 @@ class TradingBot:
             return
         self.notifier.send(message)
 
+    def _pair_cfg(self, symbol: str) -> dict[str, Any]:
+        pair_cfg = deepcopy(self.config)
+        overrides = self.pair_settings.get(symbol, {})
+        pair_cfg.update(overrides)
+        if "indicators" in overrides and isinstance(overrides["indicators"], dict):
+            ind = deepcopy(self.config.get("indicators", {}))
+            ind.update(overrides["indicators"])
+            pair_cfg["indicators"] = ind
+        return pair_cfg
+
     def check_signals(self, symbol: str, timeframe: str) -> str | None:
-        """Возвращает сигнал long/short/None."""
-        df = self.exchange.fetch_ohlcv(symbol, timeframe, self.config.get("ohlcv_limit", 100))
+        cfg = self._pair_cfg(symbol)
+        df = self.exchange.fetch_ohlcv(symbol, timeframe, cfg.get("ohlcv_limit", 100))
         if df is None or df.empty:
             return None
 
-        ind = self.config.get("indicators", {})
+        ind = cfg.get("indicators", {})
         if ind.get("rsi", {}).get("enabled"):
             df = add_rsi(df, ind["rsi"].get("period", 14))
         if ind.get("macd", {}).get("enabled"):
@@ -98,174 +109,141 @@ class TradingBot:
         rsi_value = last.get(rsi_col)
         bb_low = last.get(f"bb_lower_{bb_suffix}")
         bb_up = last.get(f"bb_upper_{bb_suffix}")
-        if rsi_value is None or bb_low is None or bb_up is None:
-            return None
-        if rsi_value < 30 and close < bb_low:
-            return "long"
-        if rsi_value > 70 and close > bb_up:
-            return "short"
-        return None
+        signal = None
+        if rsi_value is not None and bb_low is not None and bb_up is not None:
+            if rsi_value < 30 and close < bb_low:
+                signal = "long"
+            elif rsi_value > 70 and close > bb_up:
+                signal = "short"
+
+        with self._lock:
+            self.signal_log.append({"symbol": symbol, "signal": signal or "none", "price": close, "time": time.time()})
+            self.signal_log = self.signal_log[-300:]
+        return signal
 
     def _can_open_position(self, symbol: str) -> bool:
-        if not self.multi_pair_manager.can_open_new_position(symbol):
-            return False
-        return symbol not in self.active_positions
+        return self.multi_pair_manager.can_open_new_position(symbol) and symbol not in self.active_positions
 
     def execute_signal(self, symbol: str, signal: str) -> bool:
-        """Открывает позицию по сигналу, если это разрешено мультипарностью."""
-        if signal not in {"long", "short"}:
-            return False
-        if not self._can_open_position(symbol):
+        if signal not in {"long", "short"} or not self._can_open_position(symbol):
             return False
 
+        cfg = self._pair_cfg(symbol)
         balance = self.exchange.fetch_balance() or {}
         usdt_balance = float((balance.get("free") or {}).get("USDT") or 0.0)
         if usdt_balance <= 0:
-            self.logger.warning("Недостаточно USDT для сделки")
             self._notify("⚠️ ОШИБКА\nНедостаточно средств для открытия позиции", kind="error")
             return False
-
         if self.initial_balance <= 0:
             self.initial_balance = usdt_balance
 
         ticker = self.exchange.fetch_ticker(symbol)
         if not ticker or not ticker.get("last"):
             return False
-
         entry_price = float(ticker["last"])
-        risk_percent = float(self.config.get("risk_percent", 20.0))
-        if self.capital_mode == "pool":
-            used_balance = sum(pos.get("locked_balance", 0.0) for pos in self.active_positions.values())
-            free_for_pool = max(usdt_balance - used_balance, 0.0)
-            amount = self.risk_manager.calculate_position_size(
-                free_for_pool,
-                risk_percent,
-                float(self.config.get("leverage", 1.0)),
-                entry_price,
-            )
-        else:
-            amount = self.risk_manager.calculate_position_size(
-                usdt_balance,
-                risk_percent,
-                float(self.config.get("leverage", 1.0)),
-                entry_price,
-            )
-
+        risk_percent = float(cfg.get("risk_percent", 20.0))
+        leverage = float(cfg.get("leverage", 1.0))
+        amount = self.risk_manager.calculate_position_size(usdt_balance, risk_percent, leverage, entry_price)
         if amount <= 0:
             return False
 
-        if self.config.get("signals_only", True):
-            self.logger.info("Signals-only: %s %s", symbol, signal)
-            return True
-
-        side = "buy" if signal == "long" else "sell"
-        order_mode = self.config.get("entry_order_type", "market")
-        if order_mode == "limit":
-            deviation = float(self.config.get("limit_deviation_percent", 0.0)) / 100.0
-            target_price = entry_price * (1 + deviation)
-            fallback_to_market = self.config.get("limit_fallback", "cancel") == "market"
-            order_result = self.order_manager.place_limit_order_with_retry(
-                symbol=symbol,
-                side=side,
-                amount=amount,
-                price=target_price,
-                max_attempts=int(self.config.get("limit_max_attempts", 0)),
-                interval=int(self.config.get("limit_interval_sec", 5)),
-                fallback_to_market=fallback_to_market,
-            )
+        is_long = signal == "long"
+        side = "buy" if is_long else "sell"
+        if cfg.get("signals_only", True):
+            order_result = {"id": f"signal-{int(time.time())}"}
         else:
-            order_result = self.order_manager.place_order(symbol, side, amount, "market")
-
+            order_type = cfg.get("entry_order_type", "market")
+            if order_type == "limit":
+                deviation = float(cfg.get("limit_deviation_percent", -0.1))
+                limit_price = entry_price * (1 + deviation / 100.0)
+                order_result = self.order_manager.place_limit_order_with_retry(
+                    symbol, side, amount, limit_price,
+                    max_attempts=int(cfg.get("limit_max_attempts", 0)),
+                    interval=int(cfg.get("limit_interval_sec", 5)),
+                    fallback_to_market=cfg.get("limit_fallback", "cancel") == "market",
+                )
+            else:
+                order_result = self.order_manager.place_order(symbol, side, amount, "market")
         if not order_result:
             return False
 
-        is_long = signal == "long"
-        stop_loss = self.risk_manager.calculate_stop_loss(entry_price, float(self.config.get("stop_loss_percent", 1.0)), is_long)
-        take_profit = self.risk_manager.calculate_take_profit(entry_price, float(self.config.get("take_profit_percent", 2.0)), is_long)
-        self.order_manager.set_stop_loss_take_profit(
-            symbol=symbol,
-            position_side=signal,
-            entry_price=entry_price,
-            stop_loss_percent=float(self.config.get("stop_loss_percent", 1.0)),
-            take_profit_percent=float(self.config.get("take_profit_percent", 2.0)),
-            amount=amount,
-        )
+        stop_loss = self.risk_manager.calculate_stop_loss(entry_price, float(cfg.get("stop_loss_percent", 1.0)), is_long)
+        take_profit = self.risk_manager.calculate_take_profit(entry_price, float(cfg.get("take_profit_percent", 2.0)), is_long)
 
-        avg_cfg = self.config.get("averaging", {})
-        levels = []
-        if avg_cfg.get("enabled"):
-            levels = self.risk_manager.calculate_custom_levels(entry_price, avg_cfg.get("levels", []), is_long)
+        if not cfg.get("signals_only", True):
+            self.order_manager.set_stop_loss_take_profit(symbol, "long" if is_long else "short", entry_price, float(cfg.get("stop_loss_percent", 1.0)), float(cfg.get("take_profit_percent", 2.0)), amount)
 
-        trailing_cfg = self.config.get("trailing", {})
+        avg_cfg = cfg.get("averaging", {})
+        levels: list[dict[str, Any]] = []
+        if avg_cfg.get("enabled") and avg_cfg.get("levels"):
+            levels = self.risk_manager.calculate_custom_levels(entry_price, avg_cfg["levels"], is_long)
+
         trailing = None
+        trailing_cfg = cfg.get("trailing", {})
         if trailing_cfg.get("enabled"):
             trailing = TrailingStop(
                 activation_percent=float(trailing_cfg.get("activation_percent", 1.0)),
                 step_percent=float(trailing_cfg.get("step_percent", 0.5)),
                 offset_percent=float(trailing_cfg.get("offset_percent", 0.8)),
-                use_atr=bool(trailing_cfg.get("type", "percent") == "atr"),
+                use_atr=(trailing_cfg.get("type", "percent") == "atr"),
                 atr_multiplier=float(trailing_cfg.get("atr_multiplier", 2.0)),
             )
             trailing.initialize(entry_price)
 
-        locked_balance = (entry_price * amount) / max(float(self.config.get("leverage", 1.0)), 1.0)
-        self.active_positions[symbol] = {
-            "position_id": str(order_result.get("id", "")),
-            "entry_price": entry_price,
-            "average_entry": entry_price,
-            "total_amount": amount,
-            "base_amount": amount,
-            "levels_config": levels,
-            "levels_filled": [],
-            "is_long": is_long,
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
-            "max_drawdown": float(avg_cfg.get("max_drawdown_percent", 15.0)),
-            "trailing_stop": trailing,
-            "locked_balance": locked_balance,
-        }
+        with self._lock:
+            locked_balance = (entry_price * amount) / max(leverage, 1.0)
+            self.active_positions[symbol] = {
+                "position_id": str(order_result.get("id", "")), "entry_price": entry_price, "average_entry": entry_price,
+                "total_amount": amount, "base_amount": amount, "levels_config": levels, "levels_filled": [],
+                "is_long": is_long, "stop_loss": stop_loss, "take_profit": take_profit,
+                "max_drawdown": float(avg_cfg.get("max_drawdown_percent", 15.0)), "trailing_stop": trailing,
+                "locked_balance": locked_balance,
+            }
+            st = self.pair_stats.setdefault(symbol, {"realized_pnl": 0.0, "deals": 0, "wins": 0, "losses": 0, "pnl_history": [0.0], "last_open_pnl": 0.0})
+            st["last_open_pnl"] = 0.0
+
         self.multi_pair_manager.add_position(symbol)
-        self._notify(
-            f"✅ ОТКРЫТА ПОЗИЦИЯ\nПара: {symbol}\nТип: {'LONG' if is_long else 'SHORT'}\nЦена: {entry_price:.8f}\nОбъем: {amount:.8f}",
-            kind="trade",
-        )
+        self._notify(f"✅ ОТКРЫТА ПОЗИЦИЯ\nПара: {symbol}\nТип: {'LONG' if is_long else 'SHORT'}\nЦена: {entry_price:.8f}\nОбъем: {amount:.8f}")
         return True
 
     def recalculate_with_levels(self, position_data: dict[str, Any], fill_price: float, fill_amount: float) -> None:
-        """Пересчитывает среднюю цену и общий объем после усреднения."""
         old_amount = float(position_data.get("total_amount", 0.0))
         old_avg = float(position_data.get("average_entry", position_data.get("entry_price", 0.0)))
         new_amount = old_amount + fill_amount
-        if new_amount <= 0:
-            return
-        new_avg = ((old_avg * old_amount) + (fill_price * fill_amount)) / new_amount
-        position_data["total_amount"] = new_amount
-        position_data["average_entry"] = new_avg
+        if new_amount > 0:
+            position_data["total_amount"] = new_amount
+            position_data["average_entry"] = ((old_avg * old_amount) + (fill_price * fill_amount)) / new_amount
 
     def _close_position(self, symbol: str, reason: str, current_price: float) -> None:
-        position = self.active_positions.get(symbol)
+        with self._lock:
+            position = self.active_positions.get(symbol)
         if not position:
             return
+
         side = "sell" if position.get("is_long", True) else "buy"
         amount = float(position.get("total_amount", 0.0))
-        if amount > 0:
+        if amount > 0 and not self.config.get("signals_only", True):
             self.order_manager.place_order(symbol, side, amount, "market")
+
         avg_entry = float(position.get("average_entry", position.get("entry_price", current_price)))
         pnl_abs = (current_price - avg_entry) * amount if position.get("is_long", True) else (avg_entry - current_price) * amount
-        pnl_pct = ((current_price - avg_entry) / avg_entry * 100.0) if position.get("is_long", True) else ((avg_entry - current_price) / avg_entry * 100.0)
+        pnl_pct = ((pnl_abs / (avg_entry * amount)) * 100.0) if amount > 0 and avg_entry > 0 else 0.0
+
+        with self._lock:
+            self.active_positions.pop(symbol, None)
+            st = self.pair_stats.setdefault(symbol, {"realized_pnl": 0.0, "deals": 0, "wins": 0, "losses": 0, "pnl_history": [0.0], "last_open_pnl": 0.0})
+            st["realized_pnl"] += pnl_abs
+            st["deals"] += 1
+            st["wins"] += 1 if pnl_abs >= 0 else 0
+            st["losses"] += 1 if pnl_abs < 0 else 0
+            st["last_open_pnl"] = 0.0
+            st["pnl_history"].append(st["realized_pnl"])
 
         self.multi_pair_manager.remove_position(symbol)
-        self.active_positions.pop(symbol, None)
-
-        if pnl_abs >= 0:
-            self._notify(f"💰 ПРИБЫЛЬ\nПара: {symbol}\nPNL: +{pnl_abs:.4f} USDT (+{pnl_pct:.2f}%)\nЦена выхода: {current_price:.8f}")
-        else:
-            self._notify(f"📉 УБЫТОК\nПара: {symbol}\nPNL: {pnl_abs:.4f} USDT ({pnl_pct:.2f}%)\nЦена выхода: {current_price:.8f}")
-
+        self._notify((f"💰 ПРИБЫЛЬ\nПара: {symbol}\nPNL: +{pnl_abs:.4f} USDT (+{pnl_pct:.2f}%)\nЦена выхода: {current_price:.8f}") if pnl_abs >= 0 else (f"📉 УБЫТОК\nПара: {symbol}\nPNL: {pnl_abs:.4f} USDT ({pnl_pct:.2f}%)\nЦена выхода: {current_price:.8f}"))
         self.logger.info("Позиция %s закрыта (%s)", symbol, reason)
 
     def check_custom_average_signals(self) -> None:
-        """Проверяет уровни усреднения, TP/SL и трейлинг-стоп."""
         for symbol, position in list(self.active_positions.items()):
             ticker = self.exchange.fetch_ticker(symbol)
             if not ticker or not ticker.get("last"):
@@ -273,6 +251,16 @@ class TradingBot:
             current_price = float(ticker["last"])
             is_long = bool(position.get("is_long", True))
 
+            avg_entry = float(position.get("average_entry", position.get("entry_price", current_price)))
+            amount = float(position.get("total_amount", 0.0))
+            open_pnl = ((current_price - avg_entry) * amount) if is_long else ((avg_entry - current_price) * amount)
+            with self._lock:
+                st = self.pair_stats.setdefault(symbol, {"realized_pnl": 0.0, "deals": 0, "wins": 0, "losses": 0, "pnl_history": [0.0], "last_open_pnl": 0.0})
+                st["last_open_pnl"] = open_pnl
+
+            trailing = position.get("trailing_stop")
+            if trailing:
+                trailing.update(current_price, is_long=is_long, atr_value=None)
             trailing = position.get("trailing_stop")
             if trailing:
                 updated = trailing.update(current_price, is_long=is_long, atr_value=None)
@@ -308,6 +296,10 @@ class TradingBot:
                 continue
 
             fill_amount = float(position.get("base_amount", 0.0)) * float(next_level.get("multiplier", 1.0))
+            if not self.config.get("signals_only", True):
+                side = "buy" if is_long else "sell"
+                if not self.order_manager.place_order(symbol, side, fill_amount, "market"):
+                    continue
             if self.config.get("signals_only", True):
                 next_level["filled"] = True
                 position["levels_filled"].append(next_level["level"])
@@ -358,5 +350,38 @@ class TradingBot:
         self._thread.start()
 
     def stop_loop(self) -> None:
+        self._running = False
+
+    def get_pair_statistics(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            result: dict[str, dict[str, Any]] = {}
+            for symbol, st in self.pair_stats.items():
+                deals = int(st.get("deals", 0))
+                wins = int(st.get("wins", 0))
+                result[symbol] = {
+                    "pnl_usdt": float(st.get("realized_pnl", 0.0)),
+                    "deals": deals,
+                    "winrate": (wins / deals * 100.0) if deals > 0 else 0.0,
+                    "open_pnl": float(st.get("last_open_pnl", 0.0)),
+                }
+            return result
+
+    def get_balance_curve(self, symbol: str | None = None) -> list[float]:
+        with self._lock:
+            if symbol and symbol in self.pair_stats:
+                return list(self.pair_stats[symbol].get("pnl_history", [0.0]))
+            totals = [0.0]
+            max_len = max((len(v.get("pnl_history", [0.0])) for v in self.pair_stats.values()), default=1)
+            for i in range(1, max_len):
+                value = 0.0
+                for v in self.pair_stats.values():
+                    hist = v.get("pnl_history", [0.0])
+                    value += hist[i] if i < len(hist) else hist[-1]
+                totals.append(value)
+            return totals
+
+    def get_signal_rows(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self.signal_log[-100:])
         """Останавливает торговый цикл."""
         self._running = False

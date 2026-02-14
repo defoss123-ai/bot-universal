@@ -51,7 +51,7 @@ class AverageLevelsFrame(ttk.LabelFrame):
         self.levels_container = ttk.Frame(self)
         self.levels_container.pack(fill="x", padx=5)
 
-        bottom = ttk.Frame(self)
+        bottom = ttk.Frame(self.scrollable_container)
         bottom.pack(fill="x", padx=5, pady=5)
         ttk.Label(bottom, text="Макс. просадка для усреднения, %").pack(side="left")
         ttk.Entry(bottom, textvariable=self.max_drawdown_var, width=8).pack(side="left", padx=5)
@@ -225,8 +225,15 @@ class TradingBotGUI(tk.Tk):
         self.trailing_atr_mult_var = tk.DoubleVar(value=saved.get("trailing_atr_mult", 2.0))
 
         self.multipair_enabled_var = tk.BooleanVar(value=saved.get("multipair_enabled", True))
-        self.max_positions_var = tk.IntVar(value=saved.get("max_positions", 2))
         self.capital_mode_var = tk.StringVar(value=saved.get("capital_mode", "fixed"))
+        self.max_positions_var = tk.IntVar(value=min(50, saved.get("max_positions", 2)))
+        self.stats_symbol_var = tk.StringVar(value="ALL")
+        self.enabled_symbols: set[str] = set(saved.get("enabled_symbols", []))
+        self.per_pair_settings: dict[str, dict] = saved.get("per_pair_settings", {})
+        self.pair_tp_var = tk.DoubleVar(value=2.0)
+        self.pair_sl_var = tk.DoubleVar(value=1.0)
+        self.pair_risk_var = tk.DoubleVar(value=20.0)
+        self.pair_min_spread_var = tk.DoubleVar(value=0.0)
 
         self.signals_only_var = tk.BooleanVar(value=saved.get("signals_only", True))
         self.status_balance_var = tk.StringVar(value="USDT: --")
@@ -305,6 +312,8 @@ class TradingBotGUI(tk.Tk):
             "multipair_enabled": self.multipair_enabled_var.get(),
             "max_positions": self.max_positions_var.get(),
             "capital_mode": self.capital_mode_var.get(),
+            "enabled_symbols": sorted(self.enabled_symbols),
+            "per_pair_settings": self.per_pair_settings,
             "telegram_enabled": self.telegram_enabled_var.get(),
             "telegram_token": self.telegram_token_var.get(),
             "telegram_chat_id": self.telegram_chat_id_var.get(),
@@ -315,7 +324,21 @@ class TradingBotGUI(tk.Tk):
         save_user_settings(data)
 
     def _build_layout(self, saved: dict) -> None:
-        notebook = ttk.Notebook(self)
+        root_container = ttk.Frame(self)
+        root_container.pack(fill="both", expand=True)
+
+        self.main_canvas = tk.Canvas(root_container, highlightthickness=0)
+        v_scroll = ttk.Scrollbar(root_container, orient="vertical", command=self.main_canvas.yview)
+        self.main_canvas.configure(yscrollcommand=v_scroll.set)
+        self.main_canvas.pack(side="left", fill="both", expand=True)
+        v_scroll.pack(side="right", fill="y")
+
+        self.scrollable_container = ttk.Frame(self.main_canvas)
+        self.main_canvas_window = self.main_canvas.create_window((0, 0), window=self.scrollable_container, anchor="nw")
+        self.scrollable_container.bind("<Configure>", lambda _e: self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all")))
+        self.main_canvas.bind("<Configure>", lambda e: self.main_canvas.itemconfigure(self.main_canvas_window, width=e.width))
+
+        notebook = ttk.Notebook(self.scrollable_container)
         notebook.pack(fill="both", expand=True, padx=10, pady=10)
 
         settings_tab = ttk.Frame(notebook)
@@ -336,7 +359,7 @@ class TradingBotGUI(tk.Tk):
         self._build_logs_tab(logs_tab)
         self._build_stats_tab(stats_tab)
 
-        bottom = ttk.Frame(self)
+        bottom = ttk.Frame(self.scrollable_container)
         bottom.pack(fill="x", padx=10, pady=(0, 10))
         ttk.Button(bottom, text="Анализировать", command=self.analyze_market).pack(side="left")
         self.result_text = scrolledtext.ScrolledText(bottom, height=8, wrap="word")
@@ -452,6 +475,21 @@ class TradingBotGUI(tk.Tk):
         ttk.Entry(mp, textvariable=self.max_positions_var, width=8).grid(row=1, column=1, sticky="w", padx=5)
         ttk.Radiobutton(mp, text="Фиксированный % на каждую пару", value="fixed", variable=self.capital_mode_var).grid(row=2, column=0, sticky="w", padx=5)
         ttk.Radiobutton(mp, text="Общий пул", value="pool", variable=self.capital_mode_var).grid(row=2, column=1, sticky="w", padx=5)
+        ttk.Label(mp, text="Активные пары (multi-select)").grid(row=3, column=0, sticky="w", padx=5)
+        self.active_pairs_listbox = tk.Listbox(mp, selectmode=tk.EXTENDED, height=6, exportselection=False)
+        self.active_pairs_listbox.grid(row=4, column=0, columnspan=2, sticky="ew", padx=5, pady=4)
+        self.active_pairs_listbox.bind("<<ListboxSelect>>", self._load_selected_pair_settings)
+        ttk.Button(mp, text="Включить выбранные", command=lambda: self._toggle_selected_symbols(True)).grid(row=5, column=0, sticky="w", padx=5, pady=2)
+        ttk.Button(mp, text="Отключить выбранные", command=lambda: self._toggle_selected_symbols(False)).grid(row=5, column=1, sticky="w", padx=5, pady=2)
+        ttk.Label(mp, text="TP%").grid(row=6, column=0, sticky="w", padx=5)
+        ttk.Entry(mp, textvariable=self.pair_tp_var, width=7).grid(row=6, column=1, sticky="w", padx=5)
+        ttk.Label(mp, text="SL%").grid(row=7, column=0, sticky="w", padx=5)
+        ttk.Entry(mp, textvariable=self.pair_sl_var, width=7).grid(row=7, column=1, sticky="w", padx=5)
+        ttk.Label(mp, text="% объема").grid(row=8, column=0, sticky="w", padx=5)
+        ttk.Entry(mp, textvariable=self.pair_risk_var, width=7).grid(row=8, column=1, sticky="w", padx=5)
+        ttk.Label(mp, text="Мин. спред%").grid(row=9, column=0, sticky="w", padx=5)
+        ttk.Entry(mp, textvariable=self.pair_min_spread_var, width=7).grid(row=9, column=1, sticky="w", padx=5)
+        ttk.Button(mp, text="Сохранить настройки пары", command=self._save_selected_pair_settings).grid(row=10, column=0, columnspan=2, sticky="ew", padx=5, pady=4)
 
         order = ttk.LabelFrame(parent, text="Тип ордера для входа")
         order.pack(fill="x", padx=10, pady=6)
@@ -536,6 +574,10 @@ class TradingBotGUI(tk.Tk):
         top.pack(fill="x", padx=10, pady=8)
         self.stats_label = tk.StringVar(value="Winrate: 0% | Avg PnL: 0 | Max DD: 0%")
         ttk.Label(top, textvariable=self.stats_label, font=("Arial", 11, "bold")).pack(side="left")
+        ttk.Label(top, text="Баланс:").pack(side="left", padx=(16, 4))
+        self.stats_symbol_combo = ttk.Combobox(top, textvariable=self.stats_symbol_var, state="readonly", width=18)
+        self.stats_symbol_combo.pack(side="left")
+        self.stats_symbol_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_stats_plot())
 
         fig = Figure(figsize=(8, 4), dpi=100)
         self.balance_ax = fig.add_subplot(111)
@@ -546,6 +588,20 @@ class TradingBotGUI(tk.Tk):
 
         self.canvas = FigureCanvasTkAgg(fig, master=parent)
         self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
+
+
+        pair_stats = ttk.LabelFrame(parent, text="Статистика по парам")
+        pair_stats.pack(fill="both", expand=True, padx=10, pady=(0,10))
+        self.pair_stats_tree = ttk.Treeview(pair_stats, columns=("symbol","pnl","pnl_pct","deals","winrate","open_pnl"), show="headings", height=6)
+        for col, txt in [("symbol","Пара"),("pnl","PnL USDT"),("pnl_pct","PnL %"),("deals","Сделок"),("winrate","Winrate %"),("open_pnl","Open PnL")]:
+            self.pair_stats_tree.heading(col, text=txt)
+            self.pair_stats_tree.column(col, width=120, anchor="center")
+        self.pair_stats_tree.pack(fill="both", expand=True, padx=5, pady=5)
+        self.pair_stats_tree.bind("<<TreeviewSelect>>", self._on_pair_stat_select)
+
+        self.pair_detail_text = scrolledtext.ScrolledText(pair_stats, height=5, wrap="word")
+        self.pair_detail_text.pack(fill="x", padx=5, pady=5)
+        self.pair_detail_text.configure(state="disabled")
 
     def _toggle_limit_options(self) -> None:
         state = "normal" if self.entry_order_type_var.get() == "limit" else "disabled"
@@ -575,6 +631,7 @@ class TradingBotGUI(tk.Tk):
         self.refresh_balance(background=True)
         self.refresh_positions(background=True)
         self.update_average_preview(background=True)
+        self._refresh_pair_statistics_ui()
         self._daily_report_check()
         self.after(10_000, self._periodic_status_update)
 
@@ -590,6 +647,13 @@ class TradingBotGUI(tk.Tk):
     def _sync_trade_pairs(self) -> None:
         values = list(self.pairs_listbox.get(0, tk.END)) if hasattr(self, "pairs_listbox") else DEFAULT_PAIRS
         self.trade_pair_combo["values"] = values
+        if hasattr(self, "stats_symbol_combo"):
+            self.stats_symbol_combo["values"] = ["ALL", *values]
+        if hasattr(self, "active_pairs_listbox"):
+            self.active_pairs_listbox.delete(0, tk.END)
+            for sym in values:
+                marker = "✅" if (sym in self.enabled_symbols or not self.enabled_symbols) else "⛔"
+                self.active_pairs_listbox.insert(tk.END, f"{marker} {sym}")
         if values and self.trade_pair_var.get() not in values:
             self.trade_pair_var.set(values[0])
 
@@ -698,8 +762,14 @@ class TradingBotGUI(tk.Tk):
         self._refresh_stats_plot()
 
     def _refresh_stats_plot(self) -> None:
-        x = list(range(1, len(self.balance_history) + 1))
-        self.balance_line.set_data(x, self.balance_history)
+        series = self.balance_history
+        if self.trading_bot:
+            selected = self.stats_symbol_var.get()
+            curve = self.trading_bot.get_balance_curve(None if selected == "ALL" else selected)
+            if curve:
+                series = curve
+        x = list(range(1, len(series) + 1))
+        self.balance_line.set_data(x, series)
         self.balance_ax.relim()
         self.balance_ax.autoscale_view()
         self.canvas.draw_idle()
@@ -730,11 +800,14 @@ class TradingBotGUI(tk.Tk):
             self.positions_tree.insert("", "end", values=(p.get("symbol", ""), "лонг" if amount > 0 else "шорт", p.get("entryPrice") or p.get("average") or 0, abs(amount), p.get("unrealizedPnl") or p.get("unrealizedProfit") or 0))
 
     def _build_trader_config(self) -> dict:
-        selected = [self.pairs_listbox.get(i) for i in self.pairs_listbox.curselection()] or [self.trade_pair_var.get()]
+        selected = [self.active_pairs_listbox.get(i).split(" ",1)[1] for i in self.active_pairs_listbox.curselection()] if hasattr(self, "active_pairs_listbox") else []
+        if not selected:
+            selected = sorted(self.enabled_symbols) if self.enabled_symbols else ([self.pairs_listbox.get(i) for i in self.pairs_listbox.curselection()] or [self.trade_pair_var.get()])
         levels = self.average_levels_frame.get_levels_config()
-        max_positions = int(self.max_positions_var.get()) if self.multipair_enabled_var.get() else 1
+        max_positions = min(50, int(self.max_positions_var.get())) if self.multipair_enabled_var.get() else 1
         return {
             "symbols": selected,
+            "pair_settings": self.per_pair_settings,
             "timeframe": self.timeframe_var.get(),
             "ohlcv_limit": DEFAULT_SETTINGS["ohlcv_limit"],
             "risk_percent": float(self.trade_risk_percent_var.get()),
@@ -899,6 +972,83 @@ class TradingBotGUI(tk.Tk):
         self.result_text.delete("1.0", tk.END)
         self.result_text.insert(tk.END, result)
         self.result_text.configure(state="disabled")
+
+    def _toggle_selected_symbols(self, enabled: bool) -> None:
+        if not hasattr(self, "active_pairs_listbox"):
+            return
+        for idx in self.active_pairs_listbox.curselection():
+            symbol = self.active_pairs_listbox.get(idx).split(" ",1)[1]
+            if enabled:
+                self.enabled_symbols.add(symbol)
+            else:
+                self.enabled_symbols.discard(symbol)
+        self._save_settings()
+        self._sync_trade_pairs()
+
+    def _load_selected_pair_settings(self, _event=None) -> None:
+        if not hasattr(self, "active_pairs_listbox"):
+            return
+        sel = self.active_pairs_listbox.curselection()
+        if not sel:
+            return
+        symbol = self.active_pairs_listbox.get(sel[0]).split(" ",1)[1]
+        cfg = self.per_pair_settings.get(symbol, {})
+        self.pair_tp_var.set(float(cfg.get("take_profit_percent", self.trade_tp_var.get())))
+        self.pair_sl_var.set(float(cfg.get("stop_loss_percent", self.trade_sl_var.get())))
+        self.pair_risk_var.set(float(cfg.get("risk_percent", self.trade_risk_percent_var.get())))
+        self.pair_min_spread_var.set(float(cfg.get("min_spread_percent", 0.0)))
+
+    def _save_selected_pair_settings(self) -> None:
+        if not hasattr(self, "active_pairs_listbox"):
+            return
+        sel = self.active_pairs_listbox.curselection()
+        if not sel:
+            return
+        symbol = self.active_pairs_listbox.get(sel[0]).split(" ",1)[1]
+        self.per_pair_settings[symbol] = {
+            "take_profit_percent": float(self.pair_tp_var.get()),
+            "stop_loss_percent": float(self.pair_sl_var.get()),
+            "risk_percent": float(self.pair_risk_var.get()),
+            "min_spread_percent": float(self.pair_min_spread_var.get()),
+        }
+        self.enabled_symbols.add(symbol)
+        self._save_settings()
+
+    def _refresh_pair_statistics_ui(self) -> None:
+        if not self.trading_bot or not hasattr(self, "pair_stats_tree"):
+            return
+        for item in self.pair_stats_tree.get_children():
+            self.pair_stats_tree.delete(item)
+        stats = self.trading_bot.get_pair_statistics()
+        bal = 0.0
+        try:
+            bal = float(self.status_balance_var.get().split(":",1)[1].strip())
+        except Exception:
+            pass
+        for symbol, row in sorted(stats.items()):
+            pnl = float(row.get("pnl_usdt",0.0))
+            pct = (pnl / bal * 100.0) if bal > 0 else 0.0
+            self.pair_stats_tree.insert("", "end", values=(symbol, f"{pnl:.4f}", f"{pct:.2f}", int(row.get("deals",0)), f"{float(row.get('winrate',0.0)):.2f}", f"{float(row.get('open_pnl',0.0)):.4f}"))
+
+    def _on_pair_stat_select(self, _event=None) -> None:
+        if not self.trading_bot:
+            return
+        selected = self.pair_stats_tree.selection()
+        if not selected:
+            return
+        symbol = self.pair_stats_tree.item(selected[0], "values")[0]
+        row = self.trading_bot.get_pair_statistics().get(symbol, {})
+        lines = [
+            f"Пара: {symbol}",
+            f"PnL USDT: {float(row.get('pnl_usdt', 0.0)):.4f}",
+            f"Сделок: {int(row.get('deals', 0))}",
+            f"Winrate: {float(row.get('winrate', 0.0)):.2f}%",
+            f"Open PnL: {float(row.get('open_pnl', 0.0)):.4f}",
+        ]
+        self.pair_detail_text.configure(state="normal")
+        self.pair_detail_text.delete("1.0", tk.END)
+        self.pair_detail_text.insert(tk.END, "\n".join(lines))
+        self.pair_detail_text.configure(state="disabled")
 
 
 __all__ = ["TradingBotGUI", "AverageLevelsFrame"]
